@@ -1,0 +1,7 @@
+{
+  "key_field": "QuoteId",
+  "extract_objects": [
+    "QuoteCharges"
+  ]
+}
+
