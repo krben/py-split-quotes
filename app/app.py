@@ -8,6 +8,7 @@ import traceback
 import os
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from opencensus.ext.azure.log_exporter import AzureLogHandler
 from opencensus.common.transports.async_ import AsyncTransport
 from azure.identity import ClientSecretCredential
@@ -145,15 +146,18 @@ class AzureDataLake:
     except Exception as e:
         raise CustomError(get_failed_function_name(),f"Failed to initialize AzureDataLake: {str(e)}")
 
+
   def _load_config(self):
     """Load configuration from config.json."""
     with open(self.config_path, 'r', encoding='utf-8') as f:
       return json.load(f)
 
+
   def _get_key_value(self, quote_data):
     """Extract the key field value from quote data."""
     key_field = self.config.get("key_field", "QuoteId")
     return quote_data.get(key_field)
+
 
   def _extract_filename_parts(self, filename):
     """Extract timestamp and quote ID from filename.
@@ -175,133 +179,178 @@ class AzureDataLake:
     
     return None, None
 
-  def split_all_quotes(self):
-    """Read all quote blobs, split them, and upload to Data Lake folders."""
-    
+  def _process_blob(self, blob):
+    """Process a single blob: split it and upload to Data Lake folders."""
     try:
-        blobs = self.container_client.list_blobs(name_starts_with=self.SOURCE_PREFIX)
+        blob_name = blob.name
         extract_objects = self.config.get("extract_objects", [])
         
-        for blob in blobs:
-            blob_name = blob.name
-           
-            # Skip archived blobs
-            if blob_name.startswith(f"{self.SOURCE_PREFIX}Archive") or blob_name.startswith(f"{self.SOURCE_PREFIX}Original"):
-                continue
-            
-            # Skip blobs in extract_objects folders and original folder
-            # Check if blob path contains any extract_object folder name
-            blob_path_after_prefix = blob_name[len(self.SOURCE_PREFIX):]
-            path_parts = blob_path_after_prefix.split('/')
-            
-            # If first part of path matches any extract_object, skip it
-            if path_parts and path_parts[0] in extract_objects:
-                continue
-            
-            # Skip blobs already in original folder
-            if path_parts and path_parts[0] == "original":
-                continue
-            
-            # Skip already split files (contain _{ObjectName})
-            base_name = os.path.basename(blob_name).replace('.json', '')
-            parts = base_name.split('_')
-            if len(parts) > 2:  # Already split
-                continue
+        # Skip blobs in extract_objects folders and original folder
+        # Check if blob path contains any extract_object folder name
+        blob_path_after_prefix = blob_name[len(self.SOURCE_PREFIX):]
+        path_parts = blob_path_after_prefix.split('/')
+        
+        # If first part of path matches any extract_object, skip it
+        if path_parts and path_parts[0] in extract_objects:
+            return
+        
+        # Skip blobs already in original folder
+        if path_parts and path_parts[0] == "original":
+            return
+        
+        # Skip already split files (contain _{ObjectName})
+        base_name = os.path.basename(blob_name).replace('.json', '')
+        parts = base_name.split('_')
+        if len(parts) > 2:  # Already split
+            return
 
-            # Read original blob content
-            source_blob = self.container_client.get_blob_client(blob_name)
-            raw_content = source_blob.download_blob().readall().decode('utf-8')
-            print(f"Blob name: {blob_name}")
-            #print(f"Raw content: {raw_content}")
-            # Parse JSON
-            quote_data = json.loads(raw_content)
+        # Read original blob content
+        source_blob = self.container_client.get_blob_client(blob_name)
+        raw_content = source_blob.download_blob().readall().decode('utf-8') 
+        print(f"Blob name: {blob_name}")
+        #print(f"Raw content: {raw_content}")
+        # Parse JSON
+        quote_data = json.loads(raw_content)
 
-            # Get key value
-            key_value = self._get_key_value(quote_data)
-            if not key_value:
+        # Get key value
+        key_value = self._get_key_value(quote_data)
+        # Skip if key_field doesn't contain any data (None, empty string, empty list, empty dict)
+        if not key_value or (isinstance(key_value, str) and not key_value.strip()) or (isinstance(key_value, (list, dict)) and len(key_value) == 0):
+            logger_api.log_event(
+                "split_quote_skipped",
+                f"Key field '{self.config.get('key_field', 'QuoteId')}' is missing or empty in quote data",
+                severity="WARNING",
+                blob_name=blob_name
+            )
+            return
+
+        # Extract filename parts
+        filename = os.path.basename(blob_name)
+        timestamp, quote_id_from_file = self._extract_filename_parts(filename)
+        
+        # Use quote_id from file if available, otherwise use key_value
+        quote_id = quote_id_from_file if quote_id_from_file else key_value
+
+        # If no timestamp in filename, use current timestamp
+        if not timestamp:
+            timestamp = str(int(time.time()))
+
+        # Extract each object
+        split_successful = False
+        
+        for obj_name in extract_objects:
+            if obj_name not in quote_data:
+                # Skip if object doesn't exist in quote data
+                continue
+            
+            # Skip if object is empty (empty array, empty dict, empty string, etc.)
+            obj_value = quote_data[obj_name]
+            if not obj_value or (isinstance(obj_value, str) and not obj_value.strip()) or (isinstance(obj_value, (list, dict)) and len(obj_value) == 0):
                 logger_api.log_event(
-                    "split_quote_skipped",
-                    f"Key field '{self.config['key_field']}' not found in quote data",
+                    "extract_object_skipped",
+                    f"Extract object '{obj_name}' is empty, skipping file generation",
                     severity="WARNING",
-                    blob_name=blob_name
-                )
-                continue
-
-            # Extract filename parts
-            filename = os.path.basename(blob_name)
-            timestamp, quote_id_from_file = self._extract_filename_parts(filename)
-            
-            # Use quote_id from file if available, otherwise use key_value
-            quote_id = quote_id_from_file if quote_id_from_file else key_value
-
-            # If no timestamp in filename, use current timestamp
-            if not timestamp:
-                import time
-                timestamp = str(int(time.time()))
-
-            # Extract each object
-            extract_objects = self.config.get("extract_objects", [])
-            split_successful = False
-            
-            for obj_name in extract_objects:
-                if obj_name not in quote_data:
-                    # Skip if object doesn't exist in quote data
-                    continue
-                
-                # Create extracted data with key field, the object, and Tracking
-                extracted_data = {
-                    self.config["key_field"]: key_value,
-                    obj_name: quote_data[obj_name]
-                }
-                
-                # Always include Tracking object if it exists
-                if "Tracking" in quote_data:
-                    extracted_data["Tracking"] = quote_data["Tracking"]
-                
-                # Create output filename
-                output_filename = f"{timestamp}_{quote_id}_{obj_name}.json"
-                
-                # Create blob path with object folder: {SOURCE_PREFIX}{obj_name}/{filename}
-                output_blob_path = f"{self.SOURCE_PREFIX}{obj_name}/{output_filename}"
-                
-                # Upload extracted data to blob
-                output_blob = self.container_client.get_blob_client(output_blob_path)
-                output_content = json.dumps(extracted_data, indent=2, ensure_ascii=False)
-                output_blob.upload_blob(output_content.encode('utf-8'), overwrite=True)
-                
-                logger_api.log_event(
-                    "quote_split_success",
-                    f"Split quote object uploaded",
-                    severity="INFO",
-                    blob_name=output_blob_path,
+                    blob_name=blob_name,
                     object_name=obj_name,
                     quote_id=key_value
                 )
-                
-                print(f"Created: {output_blob_path}")
-                split_successful = True
+                continue
             
-            # Move original blob to /original folder after successful split
-            if split_successful:
-                filename = os.path.basename(blob_name)
-                original_blob_path = f"{self.SOURCE_PREFIX}Original/{filename}"
-                
-                # Copy blob to original folder (we already have the content in raw_content)
-                original_blob = self.container_client.get_blob_client(original_blob_path)
-                original_blob.upload_blob(raw_content.encode('utf-8'), overwrite=True)
-                
-                # Delete original blob after successful copy
-                source_blob.delete_blob()
-                
-                logger_api.log_event(
-                    "quote_moved_to_original",
-                    f"Original quote moved to original folder",
-                    severity="INFO",
-                    original_path=blob_name,
-                    new_path=original_blob_path,
-                    quote_id=key_value
-                )
-                print(f"Moved original to: {original_blob_path}")
+            # Create extracted data with key field, the object, and Tracking
+            extracted_data = {
+                self.config["key_field"]: key_value,
+                obj_name: quote_data[obj_name]
+            }
+            
+            # Always include Tracking object if it exists
+            if "Tracking" in quote_data:
+                extracted_data["Tracking"] = quote_data["Tracking"]
+            
+            # Create output filename
+            output_filename = f"{timestamp}_{quote_id}_{obj_name}.json"
+            
+            # Create blob path with object folder: {SOURCE_PREFIX}{obj_name}/{filename}
+            output_blob_path = f"{self.SOURCE_PREFIX}{obj_name}/{output_filename}"
+            
+            # Upload extracted data to blob
+            output_blob = self.container_client.get_blob_client(output_blob_path)
+            output_content = json.dumps(extracted_data, indent=2, ensure_ascii=False)
+            output_blob.upload_blob(output_content.encode('utf-8'), overwrite=True)
+            
+            logger_api.log_event(
+                "quote_split_success",
+                f"Split quote object uploaded",
+                severity="INFO",
+                blob_name=output_blob_path,
+                object_name=obj_name,
+                quote_id=key_value
+            )
+            
+            print(f"Created: {output_blob_path}")
+            split_successful = True
+        
+        # Move original blob to /original folder after processing (even if no files were created)
+        filename = os.path.basename(blob_name)
+        original_blob_path = f"{self.SOURCE_PREFIX}Original/{filename}"
+        
+        # Copy blob to original folder (we already have the content in raw_content)
+        original_blob = self.container_client.get_blob_client(original_blob_path)
+        original_blob.upload_blob(raw_content.encode('utf-8'), overwrite=True)
+        
+        # Delete original blob after successful copy
+        source_blob.delete_blob()
+        
+        logger_api.log_event(
+            "quote_moved_to_original",
+            f"Original quote moved to original folder",
+            severity="INFO",
+            original_path=blob_name,
+            new_path=original_blob_path,
+            quote_id=key_value,
+            files_created=split_successful
+        )
+        print(f"Moved original to: {original_blob_path}")
+    
+    except Exception as e:
+        logger_api.log_event(
+            "blob_processing_error",
+            f"Error processing blob: {str(e)}",
+            severity="ERROR",
+            blob_name=blob.name if hasattr(blob, 'name') else 'unknown'
+        )
+        raise
+
+  def split_all_quotes(self):
+    """Read all quote blobs, split them, and upload to Data Lake folders using 4 threads."""
+    
+    try:
+        all_blobs = self.container_client.list_blobs(name_starts_with=self.SOURCE_PREFIX)
+        
+        # Filter out Archive blobs before processing
+        blobs = [
+            blob for blob in all_blobs 
+            if "Archive" not in blob.name[len(self.SOURCE_PREFIX):].split('/')
+            and not blob.name.startswith(f"{self.SOURCE_PREFIX}Archive")
+            and not blob.name.startswith(f"{self.SOURCE_PREFIX}Original")
+        ]
+        
+        # Process blobs in parallel with 4 threads
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Submit all blob processing tasks
+            future_to_blob = {executor.submit(self._process_blob, blob): blob for blob in blobs}
+            
+            # Process completed tasks
+            for future in as_completed(future_to_blob):
+                blob = future_to_blob[future]
+                try:
+                    future.result()  # This will raise any exception that occurred
+                except Exception as e:
+                    logger_api.log_event(
+                        "blob_processing_failed",
+                        f"Failed to process blob {blob.name}: {str(e)}",
+                        severity="ERROR",
+                        blob_name=blob.name
+                    )
 
     except Exception as e:
         raise CustomError(get_failed_function_name(),f"Failed to split quotes: {str(e)}")
