@@ -7,6 +7,9 @@ import json
 import traceback
 import os
 import time
+import schedule
+import uuid
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from opencensus.ext.azure.log_exporter import AzureLogHandler
@@ -179,6 +182,27 @@ class AzureDataLake:
     
     return None, None
 
+
+  def _generate_dummy_charge(self):
+    """Generate a dummy QuoteCharge with placeholder values."""
+    return [
+      {
+        "QuoteChargeId": str(uuid.uuid4()),
+        "PaymentInfo": {
+          "Amount": 0.0,
+          "type": "DummyPaymentInfo"
+        },
+        "Payer": "Internal",
+        "Reference": "DUMMY",
+        "Description": "Dummy charge - generated when QuoteCharges not found",
+        "ChargedAmount": 0.0,
+        "HasFixedValue": False,
+        "CreatedAt": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+        "ChargeCategory": "FreightVirs"
+      }
+    ]
+
+
   def _process_blob(self, blob):
     """Process a single blob: split it and upload to Data Lake folders."""
     try:
@@ -239,9 +263,20 @@ class AzureDataLake:
         split_successful = False
         
         for obj_name in extract_objects:
-            if obj_name not in quote_data:
-                # Skip if object doesn't exist in quote data
-                continue
+            # Generate dummy charge if QuoteCharges is missing
+            if len(quote_data[obj_name]) == 0:
+                
+                if obj_name == "QuoteCharges":
+                    quote_data[obj_name] = self._generate_dummy_charge()
+                    logger_api.log_event(
+                        "dummy_charge_generated",
+                        f"Generated dummy charge for missing QuoteCharges",
+                        severity="INFO",
+                        blob_name=blob_name,
+                        quote_id=key_value
+                    )
+                print(f"Dummy charge generated for {quote_data[obj_name]}")
+
             
             # Skip if object is empty (empty array, empty dict, empty string, etc.)
             obj_value = quote_data[obj_name]
@@ -375,19 +410,18 @@ def main():
 
  
 if __name__ == "__main__":
-  logger_api = LoggerAPI()
-  logger_api.log_event(
-    "Start",
-    "Starting QuotesSplitter-Service script",
-    severity="INFO",
-  )
+    logger_api = LoggerAPI()
+    logger_api.log_event(
+        "Start",
+        "Starting QuotesSplitter-Service script",
+        severity="INFO",
+    )
 
-  main()
-  
 
- # #Schedule the script to run daily at 00:00  
- # schedule.every().day.at("00:00").do(main)
+    # main()
 
- # while True:
- #   schedule.run_pending()
- #   time.sleep(300)  # Sleep for 5 minutes
+    # Schedule the script to run every hour
+    schedule.every().hour.do(main)
+    while True:
+        schedule.run_pending()
+        time.sleep(300)  # Sleep for 5 minutes
