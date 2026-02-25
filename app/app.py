@@ -230,7 +230,20 @@ class AzureDataLake:
 
         # Read original blob content
         source_blob = self.container_client.get_blob_client(blob_name)
-        raw_content = source_blob.download_blob().readall().decode('utf-8') 
+
+        # Skip blobs that are currently being uploaded (have an active lease)
+        blob_properties = source_blob.get_blob_properties()
+        if blob_properties.lease.status == "locked":
+            print(f"Skipping locked blob (active upload): {blob_name}")
+            logger_api.log_event(
+                "blob_skipped_locked",
+                f"Blob skipped due to active lease (upload in progress)",
+                severity="WARNING",
+                blob_name=blob_name
+            )
+            return
+
+        raw_content = source_blob.download_blob(timeout=30).readall().decode('utf-8')
         print(f"Blob name: {blob_name}")
         #print(f"Raw content: {raw_content}")
         # Parse JSON
@@ -357,28 +370,34 @@ class AzureDataLake:
 
   def split_all_quotes(self):
     """Read all quote blobs, split them, and upload to Data Lake folders using 4 threads."""
-    
+
     try:
-        all_blobs = self.container_client.list_blobs(name_starts_with=self.SOURCE_PREFIX)
-        
-        # Filter out Archive blobs before processing
+        # Use walk_blobs with delimiter to only get blobs at the root level of the quotes folder
+        # This avoids listing all blobs in subfolders (Original/, Archive/, extract objects)
+        print(f"Listing blobs in {self.SOURCE_PREFIX}...")
         blobs = [
-            blob for blob in all_blobs 
-            if "Archive" not in blob.name[len(self.SOURCE_PREFIX):].split('/')
-            and not blob.name.startswith(f"{self.SOURCE_PREFIX}Archive")
-            and not blob.name.startswith(f"{self.SOURCE_PREFIX}Original")
+            blob for blob in self.container_client.walk_blobs(name_starts_with=self.SOURCE_PREFIX, delimiter='/')
+            if hasattr(blob, 'size')  # Only actual blobs, not BlobPrefix (subfolder) entries
         ]
+        print(f"Found {len(blobs)} blobs to process")
         
         # Process blobs in parallel with 4 threads
         with ThreadPoolExecutor(max_workers=4) as executor:
             # Submit all blob processing tasks
             future_to_blob = {executor.submit(self._process_blob, blob): blob for blob in blobs}
-            
-            # Process completed tasks
-            for future in as_completed(future_to_blob):
+
+            # Process completed tasks with a timeout to prevent hanging
+            for future in as_completed(future_to_blob, timeout=300):
                 blob = future_to_blob[future]
                 try:
-                    future.result()  # This will raise any exception that occurred
+                    future.result(timeout=60)  # Per-blob timeout
+                except TimeoutError:
+                    logger_api.log_event(
+                        "blob_processing_timeout",
+                        f"Timed out processing blob {blob.name}",
+                        severity="ERROR",
+                        blob_name=blob.name
+                    )
                 except Exception as e:
                     logger_api.log_event(
                         "blob_processing_failed",
@@ -394,7 +413,9 @@ def main():
 
   try:
     # Initialize the Data Lake client and split quotes
+    print("Initializing AzureDataLake...")
     data_lake = AzureDataLake(config_path="config.json")
+    print("AzureDataLake initialized, starting split...")
     data_lake.split_all_quotes()
 
 
